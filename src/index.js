@@ -98,19 +98,9 @@ function setSessionCookie(reply, value) {
   });
 }
 
-// GET /_gate?t=TOKEN
-app.get("/_gate", async (req, reply) => {
-  if (wantsCloudflareHeaders() && !hasAccessHeaders(req)) {
-    req.log.warn("Missing Cloudflare Access headers");
-    return redirectToOpenStudio(req, reply);
-  }
-
-  const token = req.query?.t;
-  if (!token) return reply.code(400).send("Missing token");
-
-  // Verify via Control Center
+// Call upstream verify URL; returns { ok: true, session? } or { ok: false }.
+async function verifyTokenWithUpstream(token) {
   const body = JSON.stringify({ token, projectSlug: PROJECT_SLUG });
-
   let res;
   try {
     res = await request(STUDIO_GATE_VERIFY_URL, {
@@ -122,21 +112,51 @@ app.get("/_gate", async (req, reply) => {
       body
     });
   } catch (e) {
-    req.log.error({ err: e }, "verify request failed");
-    return reply.code(502).send("Gate verify unavailable");
+    return { ok: false };
   }
-
   const text = await res.body.text();
   let data = null;
-  try { data = JSON.parse(text); } catch {}
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return { ok: false };
+  }
+  if (!data?.ok) return { ok: false };
+  return { ok: true, session: data.session };
+}
 
-  if (!data?.ok) {
+// POST /_gate/verify — body: { "token": "..." }; response: { "ok": true } | { "ok": false }
+app.post("/_gate/verify", async (req, reply) => {
+  if (wantsCloudflareHeaders() && !hasAccessHeaders(req)) {
+    req.log.warn("Missing Cloudflare Access headers");
+    return reply.code(403).send({ ok: false });
+  }
+  const token = req.body?.token;
+  if (!token || typeof token !== "string") {
+    return reply.code(400).send({ ok: false });
+  }
+  const result = await verifyTokenWithUpstream(token);
+  return reply.send({ ok: result.ok });
+});
+
+// GET /_gate?t=TOKEN
+app.get("/_gate", async (req, reply) => {
+  if (wantsCloudflareHeaders() && !hasAccessHeaders(req)) {
+    req.log.warn("Missing Cloudflare Access headers");
+    return redirectToOpenStudio(req, reply);
+  }
+
+  const token = req.query?.t;
+  if (!token) return reply.code(400).send("Missing token");
+
+  const result = await verifyTokenWithUpstream(token);
+  if (!result.ok) {
     return reply.code(403).send("Invalid or expired link. Please reopen from Control Center.");
   }
 
   // Preferred: Control Center returns `session` (opaque string)
   // Fallback: mint locally (signed) if Control Center doesn't provide one.
-  let sessionValue = data.session;
+  let sessionValue = result.session;
   if (!sessionValue) {
     const now = Math.floor(Date.now() / 1000);
     sessionValue = signSession({ projectSlug: PROJECT_SLUG, exp: now + ttlSeconds });
